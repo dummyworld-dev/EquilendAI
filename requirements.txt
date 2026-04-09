@@ -2,7 +2,10 @@ streamlit
 pandas
 numpy
 scikit-learn
-xgboost
-shap
 pymongo
-python-dotenv
+xgboost
+lightgbm
+imbalanced-learn 
+shap
+faker
+pytest
