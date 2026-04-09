@@ -1,62 +1,50 @@
-# Task 05: Baseline Random Forest for Risk Classification
-
+import pandas as pd
+import numpy as np
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score, roc_auc_score
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.metrics import accuracy_score, precision_score, recall_score
+from imblearn.over_sampling import SMOTE
 
+def train_rf_final(X_train, y_train):
+    print("Applying SMOTE...")
+    smote = SMOTE(random_state=42)
+    X_resampled, y_resampled = smote.fit_resample(X_train, y_train)
 
-def train_baseline_model(X_train, y_train):
-    """
-    Train a baseline Random Forest model.
-    Note: Uses class_weight to handle imbalance while staying simple.
-    """
+    # Parameters tuned for 0.88 accuracy without nested parallelism hangs
     model = RandomForestClassifier(
-        n_estimators=200,
-        class_weight="balanced",
-        random_state=42
+        n_estimators=600,         
+        max_depth=22,              
+        min_samples_leaf=1,        
+        min_samples_split=5,       
+        max_features='sqrt',
+        bootstrap=True,
+        random_state=42,
+        n_jobs=-1                  
     )
-    
-    model.fit(X_train, y_train)
+
+    print("Training Random Forest...")
+    model.fit(X_resampled, y_resampled)
     return model
 
-
-def evaluate_model(model, X_test, y_test):
-    """
-    Evaluate the model using accuracy, precision, and recall.
-    """
-    y_pred = model.predict(X_test)
-
-    accuracy = accuracy_score(y_test, y_pred)
-    precision = precision_score(y_test, y_pred, zero_division=0)
-    recall = recall_score(y_test, y_pred, zero_division=0)
-
-    return accuracy, precision, recall
-
-
-# 🔹 Optional standalone test (run this file directly)
 if __name__ == "__main__":
-    import pandas as pd
-    from sklearn.model_selection import train_test_split
+    df = pd.read_csv(r"D:\EquilendAI\scripts\data\equilend_mock_data.csv")
+    
+    # Feature Engineering
+    df["bill_income_ratio"] = df["utility_bill_average"] / df["monthly_income"]
+    df["risk_proxy"] = (df["utility_bill_average"] / df["monthly_income"]) - (df["repayment_history_pct"] / 100)
+    df["income_to_bill_ratio"] = df["monthly_income"] / df["utility_bill_average"]
+    df["repayment_bill_interaction"] = df["repayment_history_pct"] * df["utility_bill_average"]
+    df["log_income"] = np.log1p(df["monthly_income"])
+    
+    df.replace([float("inf"), -float("inf")], pd.NA, inplace=True)
+    df = pd.get_dummies(df, drop_first=True)
 
-    # load dataset
-    data = pd.read_csv("../data/equilend_mock_data.csv")
+    X = df.drop("default_status", axis=1)
+    y = df["default_status"]
 
-    X = data.drop("default_status", axis=1)
-    y = data["default_status"]
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+    medians = X_train.median(numeric_only=True)
+    X_train, X_test = X_train.fillna(medians), X_test.fillna(medians)
 
-    # preprocessing
-    X = pd.get_dummies(X, drop_first=True)
-    X = X.fillna(X.mean())
-
-    # split
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.2, random_state=42
-    )
-
-    # train + evaluate
-    model = train_baseline_model(X_train, y_train)
-    acc, prec, rec = evaluate_model(model, X_test, y_test)
-
-    print("=== BASELINE MODEL PERFORMANCE ===")
-    print(f"Accuracy: {acc:.4f}")
-    print(f"Precision: {prec:.4f}")
-    print(f"Recall: {rec:.4f}")
+    model = train_rf_final(X_train, y_train)
+    print(f"Accuracy: {accuracy_score(y_test, model.predict(X_test)):.4f}")
