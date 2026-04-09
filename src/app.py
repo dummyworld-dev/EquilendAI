@@ -65,9 +65,10 @@ def load_model_and_preprocessor():
 
     return artifact
 
+
 def main():
     st.set_page_config(page_title="EquiLend AI - Credit Scoring", layout="wide")
-    
+
     st.title("⚖️ EquiLend AI: Transparent Credit Scoring")
     st.markdown("### Assessing creditworthiness through alternative data.")
 
@@ -79,14 +80,14 @@ def main():
         st.subheader("Manual Loan Application")
 
         artifact = load_model_and_preprocessor()
-        
+
         col1, col2 = st.columns(2)
-        
+
         with col1:
             name = st.text_input("Full Name")
             age = st.number_input("Age", min_value=0, max_value=120)
             income = st.number_input("Monthly Income (₹)", min_value=0)
-        
+
         with col2:
             utility_bill = st.number_input("Average Utility Bill (₹)", min_value=0)
             repayment_history = st.slider("Past Repayment Consistency (%)", 0, 100, 50)
@@ -106,14 +107,9 @@ def main():
                 st.error("Applicants must be at least 18 years old for credit scoring.")
                 return
 
-            # LOGICAL ERRORS 1, 2, and 3 are hidden in this block
-            with st.spinner('AI Model Calculating...'):
-                time.sleep(1) # Simulate processing
-                
-                # Build raw features from user input using the same schema as training.
-                # Note: "age" is currently collected for UX, but the synthetic dataset
-                # used in training does not contain age/state columns, so it is not
-                # included in the model feature set.
+            with st.spinner("AI Model Calculating..."):
+                time.sleep(1)  # Simulate processing
+
                 input_data = {
                     "gender": gender,
                     "monthly_income": income,
@@ -138,14 +134,8 @@ def main():
                     default_proba = max(default_proba, 0.95)
 
                 st.success(f"Analysis Complete for {name}")
-                st.metric(
-                    label="Predicted Default Probability",
-                    value=f"{default_proba:.2%}",
-                )
-                st.metric(
-                    label="Model Test AUC",
-                    value=f"{artifact.test_auc:.4f}",
-                )
+                st.metric(label="Predicted Default Probability", value=f"{default_proba:.2%}")
+                st.metric(label="Model Test AUC", value=f"{artifact.test_auc:.4f}")
                 st.write(f"Recommended Decision: **{risk_level} Risk**")
                 if zero_trust_block:
                     st.error(f"Zero-Trust Safety Triggered: {block_reason}")
@@ -176,9 +166,6 @@ def main():
 
                 # SHAP-based explanation for this specific prediction.
                 with st.expander("Explain this prediction (SHAP)"):
-                    # Build a DataFrame matching the model's feature space for SHAP.
-                    # We re-run encoding + scaling to obtain the exact feature vector
-                    # that was fed into the model.
                     user_df = pd.DataFrame([input_data])
                     user_encoded = encode_categorical_features(user_df)
                     user_encoded = sanitize_feature_names(user_encoded)
@@ -197,7 +184,6 @@ def main():
                         shap_values = squash_shap_values_near_zero(shap_values, factor=0.01)
                         st.caption("Black-swan mode active: SHAP values squashed near zero.")
 
-                    # Global-style bar plot for this single prediction (mean |SHAP|).
                     shap_feature_importance_bar_streamlit(
                         shap_values,
                         user_scaled_df,
@@ -205,7 +191,6 @@ def main():
                         income_feature="monthly_income",
                     )
 
-                    # Local force plot showing how each feature influenced this decision.
                     shap_single_prediction_force_plot_streamlit(
                         explainer,
                         shap_values,
@@ -227,12 +212,11 @@ def main():
                         }
                     )
 
-                # LOGICAL ERROR 4: Data is not saved anywhere yet
-
     elif choice == "Dashboard":
         st.subheader("Lender Rules Engine Overview")
-        # Placeholder for visual charts
-        chart_data = pd.DataFrame(np.random.randn(20, 3), columns=['Approved', 'Rejected', 'Pending'])
+        chart_data = pd.DataFrame(
+            np.random.randn(20, 3), columns=["Approved", "Rejected", "Pending"]
+        )
         st.line_chart(chart_data)
 
         st.markdown("### Dummy Predictions (XGBoost)")
@@ -242,11 +226,9 @@ def main():
         else:
             try:
                 df = load_and_clean(DATA_PATH)
-                # Show a few sample predictions to prove end-to-end works.
                 sample = df.head(5).copy()
                 X_raw = sample.drop(columns=["default_status"])
 
-                # Encode and align columns to training.
                 X_enc = encode_categorical_features(X_raw)
                 X_enc = sanitize_feature_names(X_enc)
                 for col in artifact.feature_cols:
@@ -269,9 +251,7 @@ def main():
                         ]
                     ]
                 )
-                st.caption(
-                    f"Model test AUC (from training artifact): {artifact.test_auc:.4f}"
-                )
+                st.caption(f"Model test AUC (from training artifact): {artifact.test_auc:.4f}")
                 with st.expander("Model Card: Everything Visible"):
                     st.metric("AUC", f"{artifact.test_auc:.4f}")
                     st.write("Best hyperparameters")
@@ -312,7 +292,6 @@ def main():
             try:
                 with open(fairness_md_path, "r", encoding="utf-8") as f:
                     fairness_md = f.read()
-                # Render markdown report directly on dashboard for reviewers.
                 st.markdown(fairness_md)
                 st.download_button(
                     label="Download Fairness_Report.md",
@@ -325,5 +304,6 @@ def main():
         else:
             st.info("Fairness_Report.md not found in project root.")
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     main()
