@@ -15,6 +15,7 @@ Two usage modes:
 import os
 import sys
 import pickle
+import json
 
 import numpy as np
 import pandas as pd
@@ -34,6 +35,8 @@ _SRC_DIR  = os.path.dirname(_THIS_DIR)
 _ROOT_DIR = os.path.dirname(_SRC_DIR)
 if _SRC_DIR not in sys.path:
     sys.path.insert(0, _SRC_DIR)
+
+from evaluation.thresholds import get_business_recommended_threshold
 
 # ── Defaults (check both data locations) ──────────────────────────────────────
 _DATA_CANDIDATES = [
@@ -108,7 +111,7 @@ def train_and_save(
     Train XGBoost end-to-end (with preprocessing), persist artifacts to disk.
 
     Returns:
-        (model, preprocessor, y_test_array, y_prob_array, auc_score)
+        (model, preprocessor, y_test_array, y_prob_array, auc_score, threshold_info)
     """
     from preprocessing.pipeline import (
         build_preprocessing_pipeline,
@@ -150,6 +153,7 @@ def train_and_save(
 
     y_prob = model.predict_proba(X_te)[:, 1]
     auc    = roc_auc_score(y_test, y_prob)
+    threshold_info = get_business_recommended_threshold(y_test.values, y_prob)
 
     with open(os.path.join(models_dir, "xgb_model.pkl"),    "wb") as f:
         pickle.dump(model, f)
@@ -157,8 +161,10 @@ def train_and_save(
         pickle.dump(preprocessor, f)
     np.save(os.path.join(models_dir, "y_test.npy"), y_test.values)
     np.save(os.path.join(models_dir, "y_prob.npy"), y_prob)
+    with open(os.path.join(models_dir, "threshold_info.json"), "w", encoding="utf-8") as f:
+        json.dump(threshold_info, f, indent=2)
 
-    return model, preprocessor, y_test.values, y_prob, auc
+    return model, preprocessor, y_test.values, y_prob, auc, threshold_info
 
 
 def load_artifacts(models_dir: str = DEFAULT_MODELS_DIR):
@@ -166,7 +172,7 @@ def load_artifacts(models_dir: str = DEFAULT_MODELS_DIR):
     Load saved model artifacts produced by train_and_save().
 
     Returns:
-        (model, preprocessor, y_test_array, y_prob_array)
+        (model, preprocessor, y_test_array, y_prob_array, threshold_info)
         or None if any artifact is missing.
     """
     paths = {
@@ -174,6 +180,7 @@ def load_artifacts(models_dir: str = DEFAULT_MODELS_DIR):
         "preprocessor": os.path.join(models_dir, "preprocessor.pkl"),
         "y_test":       os.path.join(models_dir, "y_test.npy"),
         "y_prob":       os.path.join(models_dir, "y_prob.npy"),
+        "threshold_info": os.path.join(models_dir, "threshold_info.json"),
     }
 
     if not all(os.path.exists(p) for p in paths.values()):
@@ -184,12 +191,16 @@ def load_artifacts(models_dir: str = DEFAULT_MODELS_DIR):
     with open(paths["preprocessor"], "rb") as f:
         preprocessor = pickle.load(f)
 
-    return model, preprocessor, np.load(paths["y_test"]), np.load(paths["y_prob"])
+    with open(paths["threshold_info"], "r", encoding="utf-8") as f:
+        threshold_info = json.load(f)
+
+    return model, preprocessor, np.load(paths["y_test"]), np.load(paths["y_prob"]), threshold_info
 
 
 # ── CLI ────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     print("Training XGBoost (self-contained mode) …")
-    _, _, y_test, y_prob, auc = train_and_save()
+    _, _, y_test, y_prob, auc, threshold_info = train_and_save()
     print(f"Done — ROC-AUC = {auc:.4f}")
+    print(f"Business threshold = {threshold_info['threshold']:.2f}")
     print(f"Artifacts saved to: {DEFAULT_MODELS_DIR}/")
