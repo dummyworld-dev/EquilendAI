@@ -13,9 +13,7 @@ import os
 import sys
 import time
 
-import matplotlib
-matplotlib.use("Agg")          # must come before any other matplotlib import
-import matplotlib.pyplot as plt
+import altair as alt
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -67,9 +65,9 @@ def _sweep_thresholds(y_test_tup, y_prob_tup):
 def _do_train():
     """Train XGBoost, clear cache, rerun. Runs inside a Streamlit spinner."""
     from models.train_xgb import train_and_save
-    model, pre, y_test, y_prob, auc = train_and_save(DATA_PATH, MODELS_DIR)
+    model, pre, y_test, y_prob, auc, threshold_info = train_and_save(DATA_PATH, MODELS_DIR)
     _load_artifacts.clear()
-    return auc
+    return auc, threshold_info
 
 
 # ── Page: New Application ─────────────────────────────────────────────────────
@@ -122,7 +120,7 @@ def page_new_application():
                 st.write(f"Recommended Decision: **{risk_level} Risk**")
                 return
 
-            model, preprocessor, _, _ = artifacts
+            model, preprocessor, _, _, threshold_info = artifacts
 
             # Bug 3 fix: use the trained ML model
             input_df = pd.DataFrame([{
@@ -136,7 +134,10 @@ def page_new_application():
             prob_default = float(model.predict_proba(X_proc)[0, 1])
 
             # Read the lender's active threshold (set in Threshold Optimizer)
-            threshold = st.session_state.get("thresh_slider", 0.50)
+            threshold = st.session_state.get(
+                "thresh_slider",
+                float(threshold_info.get("threshold", 0.50)),
+            )
             decision  = "Deny — Default Risk" if prob_default >= threshold else "Approve"
             is_deny   = prob_default >= threshold
 
@@ -192,7 +193,7 @@ def page_dashboard():
         )
         return
 
-    _, _, y_test, y_prob = artifacts
+    _, _, y_test, y_prob, _ = artifacts
     auc = roc_auc_score(y_test, y_prob)
 
     c1, c2, c3 = st.columns(3)
@@ -201,16 +202,29 @@ def page_dashboard():
     c3.metric("Default Rate (test)", f"{y_test.mean():.1%}")
 
     fpr, tpr, _ = roc_curve(y_test, y_prob)
-    fig, ax = plt.subplots(figsize=(7, 4))
-    ax.plot(fpr, tpr, color=PRIMARY, lw=2, label=f"XGBoost  AUC = {auc:.4f}")
-    ax.plot([0, 1], [0, 1], "k--", lw=1, label="Random baseline")
-    ax.set_xlabel("False Positive Rate")
-    ax.set_ylabel("True Positive Rate")
-    ax.set_title("ROC Curve")
-    ax.legend(loc="lower right")
-    ax.grid(alpha=0.3)
-    st.pyplot(fig)
-    plt.close(fig)
+    roc_frame = pd.DataFrame(
+        {
+            "false_positive_rate": np.concatenate([fpr, np.array([0.0, 1.0])]),
+            "true_positive_rate": np.concatenate([tpr, np.array([0.0, 1.0])]),
+            "series": ["Model"] * len(fpr) + ["Baseline", "Baseline"],
+        }
+    )
+    chart = (
+        alt.Chart(roc_frame)
+        .mark_line(strokeWidth=3)
+        .encode(
+            x=alt.X("false_positive_rate", title="False Positive Rate"),
+            y=alt.Y("true_positive_rate", title="True Positive Rate"),
+            color=alt.Color("series", title="Curve"),
+            strokeDash=alt.condition(
+                alt.datum.series == "Baseline",
+                alt.value([6, 4]),
+                alt.value([1, 0]),
+            ),
+        )
+        .properties(title=f"ROC Curve (AUC = {auc:.4f})", height=320)
+    )
+    st.altair_chart(chart, use_container_width=True)
 
 
 # ── Page: Threshold Optimizer ─────────────────────────────────────────────────
@@ -250,14 +264,18 @@ Use this tool to explore the trade-off and lock in the threshold that matches yo
         if col_btn.button("🚀 Train Model"):
             try:
                 with st.spinner("Training XGBoost on the synthetic dataset (this takes ~10 s)…"):
-                    auc = _do_train()
-                st.success(f"✅ Training complete!  ROC-AUC = **{auc:.4f}**")
+                    auc, threshold_info = _do_train()
+                st.session_state["thresh_slider"] = float(threshold_info["threshold"])
+                st.success(
+                    f"✅ Training complete!  ROC-AUC = **{auc:.4f}** "
+                    f"| Business threshold = **{threshold_info['threshold']:.2f}**"
+                )
                 st.rerun()
             except Exception as exc:
                 st.error(f"Training failed: {exc}")
         return
 
-    _, _, y_test, y_prob = artifacts
+    _, _, y_test, y_prob, threshold_info = artifacts
     auc = roc_auc_score(y_test, y_prob)
 
     col_a, col_b, col_c, col_retrain = st.columns([2, 1, 1, 1])
@@ -267,33 +285,62 @@ Use this tool to explore the trade-off and lock in the threshold that matches yo
     if col_retrain.button("🔄 Retrain"):
         try:
             with st.spinner("Retraining…"):
-                auc = _do_train()
-            st.success(f"Retrained — AUC = {auc:.4f}")
+                auc, threshold_info = _do_train()
+            st.session_state["thresh_slider"] = float(threshold_info["threshold"])
+            st.success(
+                f"Retrained — AUC = {auc:.4f} | Business threshold = {threshold_info['threshold']:.2f}"
+            )
             st.rerun()
         except Exception as exc:
             st.error(f"Retrain failed: {exc}")
 
-    # ── Sweep (cached) ────────────────────────────────────────────────────────
-    sweep_df = _sweep_thresholds(tuple(y_test.tolist()), tuple(y_prob.tolist()))
+    try:
+        from evaluation.thresholds import (
+            find_optimal_threshold,
+            get_metrics_at_threshold,
+            optimize_threshold_from_pr_curve,
+        )
+    except Exception as exc:
+        st.error(f"Threshold optimizer import failed: {exc}")
+        return
+
+    try:
+        sweep_df = _sweep_thresholds(tuple(y_test.tolist()), tuple(y_prob.tolist()))
+    except Exception as exc:
+        st.error(f"Threshold sweep failed: {exc}")
+        return
 
     # ── Step 2: threshold slider ──────────────────────────────────────────────
     st.markdown("---")
     st.markdown("#### Step 2 — Set Decision Threshold")
 
+    st.info(
+        "Recommended business threshold: "
+        f"**{threshold_info['threshold']:.2f}** "
+        f"({threshold_info.get('objective', 'business')})."
+    )
+
     threshold = st.slider(
         "Decision Threshold  ←  lower = approve more  |  higher = approve fewer  →",
         min_value=0.01,
         max_value=0.99,
-        value=float(st.session_state.get("thresh_slider", 0.50)),
+        value=float(
+            st.session_state.get(
+                "thresh_slider",
+                float(threshold_info.get("threshold", 0.50)),
+            )
+        ),
         step=0.01,
         format="%.2f",
         key="thresh_slider",
     )
 
     # ── Step 3: live metrics ──────────────────────────────────────────────────
-    from evaluation.thresholds import get_metrics_at_threshold, find_optimal_threshold
-
-    m = get_metrics_at_threshold(y_test, y_prob, threshold)
+    try:
+        m = get_metrics_at_threshold(y_test, y_prob, threshold)
+    except Exception as exc:
+        st.error(f"Metric calculation failed at threshold {threshold:.2f}: {exc}")
+        return
 
     st.markdown("---")
     st.markdown(f"#### Step 3 — Live Metrics at Threshold = **{threshold:.2f}**")
@@ -318,24 +365,36 @@ Use this tool to explore the trade-off and lock in the threshold that matches yo
 
     with cm_col:
         cm = np.array([[m["tn"], m["fp"]], [m["fn"], m["tp"]]])
-        fig, ax = plt.subplots(figsize=(4, 3))
-        im = ax.imshow(cm, cmap="Greens")
-        ax.set_xticks([0, 1])
-        ax.set_yticks([0, 1])
-        ax.set_xticklabels(["Predicted\nApproved", "Predicted\nDenied"])
-        ax.set_yticklabels(["Actual\nPaid", "Actual\nDefault"])
-        for i in range(2):
-            for j in range(2):
-                ax.text(
-                    j, i, f"{cm[i, j]:,}",
-                    ha="center", va="center", fontsize=13, fontweight="bold",
-                    color="white" if cm[i, j] > cm.max() * 0.55 else "black",
-                )
-        fig.colorbar(im, ax=ax)
-        ax.set_title(f"Threshold = {threshold:.2f}", pad=10)
-        fig.tight_layout()
-        st.pyplot(fig)
-        plt.close(fig)
+        cm_frame = pd.DataFrame(
+            [
+                {"actual": "Paid", "predicted": "Approved", "count": int(cm[0, 0])},
+                {"actual": "Paid", "predicted": "Denied", "count": int(cm[0, 1])},
+                {"actual": "Default", "predicted": "Approved", "count": int(cm[1, 0])},
+                {"actual": "Default", "predicted": "Denied", "count": int(cm[1, 1])},
+            ]
+        )
+        heatmap = (
+            alt.Chart(cm_frame)
+            .mark_rect()
+            .encode(
+                x=alt.X("predicted:N", title="Predicted"),
+                y=alt.Y("actual:N", title="Actual"),
+                color=alt.Color("count:Q", scale=alt.Scale(scheme="greens")),
+                tooltip=["actual", "predicted", "count"],
+            )
+            .properties(title=f"Confusion Matrix at Threshold {threshold:.2f}", height=220)
+        )
+        labels = (
+            alt.Chart(cm_frame)
+            .mark_text(fontSize=14, fontWeight="bold")
+            .encode(
+                x="predicted:N",
+                y="actual:N",
+                text="count:Q",
+                color=alt.condition(alt.datum.count > cm.max() * 0.55, alt.value("white"), alt.value("black")),
+            )
+        )
+        st.altair_chart(heatmap + labels, use_container_width=True)
 
     with explain_col:
         st.markdown(f"""
@@ -356,22 +415,27 @@ Use this tool to explore the trade-off and lock in the threshold that matches yo
     st.markdown("---")
     st.markdown("#### How Metrics Shift with Threshold")
 
-    fig, ax = plt.subplots(figsize=(10, 4))
-    ax.plot(sweep_df["threshold"], sweep_df["precision"],     label="Precision",     color="#1976D2", lw=1.8)
-    ax.plot(sweep_df["threshold"], sweep_df["recall"],        label="Recall",        color="#E53935", lw=1.8)
-    ax.plot(sweep_df["threshold"], sweep_df["f1"],            label="F1 Score",      color=PRIMARY,   lw=2.5)
-    ax.plot(sweep_df["threshold"], sweep_df["approval_rate"], label="Approval Rate", color=ACCENT,    lw=1.8, linestyle="--")
-    ax.axvline(threshold, color=ORANGE, lw=2, linestyle=":", label=f"Current  ({threshold:.2f})")
-    ax.set_xlabel("Threshold")
-    ax.set_ylabel("Score / Rate")
-    ax.set_title("Metric Trade-offs Across Thresholds")
-    ax.legend(loc="center right", framealpha=0.9)
-    ax.set_xlim(0.0, 1.0)
-    ax.set_ylim(0.0, 1.05)
-    ax.grid(True, alpha=0.25)
-    fig.tight_layout()
-    st.pyplot(fig)
-    plt.close(fig)
+    metrics_frame = sweep_df.melt(
+        id_vars=["threshold"],
+        value_vars=["precision", "recall", "f1", "approval_rate"],
+        var_name="metric",
+        value_name="value",
+    )
+    line_chart = (
+        alt.Chart(metrics_frame)
+        .mark_line(strokeWidth=3)
+        .encode(
+            x=alt.X("threshold:Q", scale=alt.Scale(domain=[0, 1])),
+            y=alt.Y("value:Q", scale=alt.Scale(domain=[0, 1.05])),
+            color=alt.Color("metric:N", title="Metric"),
+            tooltip=["threshold", "metric", "value"],
+        )
+        .properties(title="Metric Trade-offs Across Thresholds", height=320)
+    )
+    threshold_rule = alt.Chart(
+        pd.DataFrame({"threshold": [threshold], "label": [f"Current ({threshold:.2f})"]})
+    ).mark_rule(color=ORANGE, strokeDash=[6, 4], strokeWidth=2).encode(x="threshold:Q")
+    st.altair_chart(line_chart + threshold_rule, use_container_width=True)
 
     # ── Step 6: ROC and PR curves ─────────────────────────────────────────────
     st.markdown("---")
@@ -390,21 +454,25 @@ Use this tool to explore the trade-off and lock in the threshold that matches yo
         else:
             pt_fpr, pt_tpr = None, None
 
-        fig, ax = plt.subplots(figsize=(5, 4))
-        ax.plot(fpr_arr, tpr_arr, color=PRIMARY, lw=2, label=f"AUC = {auc:.4f}")
-        ax.plot([0, 1], [0, 1], "k--", lw=1, label="Random baseline")
+        roc_frame = pd.DataFrame({"fpr": fpr_arr, "tpr": tpr_arr})
+        baseline_frame = pd.DataFrame({"fpr": [0.0, 1.0], "tpr": [0.0, 1.0]})
+        chart = (
+            alt.Chart(roc_frame)
+            .mark_line(color=PRIMARY, strokeWidth=3)
+            .encode(x=alt.X("fpr:Q", title="False Positive Rate"), y=alt.Y("tpr:Q", title="True Positive Rate"))
+            .properties(title="ROC Curve", height=280)
+        )
+        baseline = (
+            alt.Chart(baseline_frame)
+            .mark_line(color="gray", strokeDash=[6, 4])
+            .encode(x="fpr:Q", y="tpr:Q")
+        )
+        layers = chart + baseline
         if pt_fpr is not None:
-            ax.scatter([pt_fpr], [pt_tpr], color=ORANGE, s=120, zorder=5,
-                       label=f"Threshold {threshold:.2f}")
-        ax.set_xlabel("False Positive Rate")
-        ax.set_ylabel("True Positive Rate (Recall)")
-        ax.set_title("ROC Curve")
-        ax.legend(loc="lower right")
-        ax.set_xlim(0, 1); ax.set_ylim(0, 1.05)
-        ax.grid(alpha=0.25)
-        fig.tight_layout()
-        st.pyplot(fig)
-        plt.close(fig)
+            point_frame = pd.DataFrame({"fpr": [pt_fpr], "tpr": [pt_tpr]})
+            point = alt.Chart(point_frame).mark_point(color=ORANGE, size=100).encode(x="fpr:Q", y="tpr:Q")
+            layers = layers + point
+        st.altair_chart(layers, use_container_width=True)
 
     with pr_col:
         if len(pr_thresh) > 1:
@@ -413,22 +481,25 @@ Use this tool to explore the trade-off and lock in the threshold that matches yo
         else:
             pt_rec_v, pt_prec_v = None, None
 
-        fig, ax = plt.subplots(figsize=(5, 4))
-        ax.plot(pr_rec, pr_prec, color=ACCENT, lw=2, label="PR Curve")
-        ax.axhline(float(y_test.mean()), color="k", linestyle="--", lw=1,
-                   label=f"Baseline ({y_test.mean():.2f})")
+        pr_frame = pd.DataFrame({"recall": pr_rec, "precision": pr_prec})
+        baseline_frame = pd.DataFrame({"recall": [0.0, 1.0], "precision": [float(y_test.mean()), float(y_test.mean())]})
+        chart = (
+            alt.Chart(pr_frame)
+            .mark_line(color=ACCENT, strokeWidth=3)
+            .encode(x=alt.X("recall:Q", title="Recall"), y=alt.Y("precision:Q", title="Precision"))
+            .properties(title="Precision-Recall Curve", height=280)
+        )
+        baseline = (
+            alt.Chart(baseline_frame)
+            .mark_line(color="gray", strokeDash=[6, 4])
+            .encode(x="recall:Q", y="precision:Q")
+        )
+        layers = chart + baseline
         if pt_rec_v is not None:
-            ax.scatter([pt_rec_v], [pt_prec_v], color=ORANGE, s=120, zorder=5,
-                       label=f"Threshold {threshold:.2f}")
-        ax.set_xlabel("Recall")
-        ax.set_ylabel("Precision")
-        ax.set_title("Precision-Recall Curve")
-        ax.legend(loc="upper right")
-        ax.set_xlim(0, 1); ax.set_ylim(0, 1.05)
-        ax.grid(alpha=0.25)
-        fig.tight_layout()
-        st.pyplot(fig)
-        plt.close(fig)
+            point_frame = pd.DataFrame({"recall": [pt_rec_v], "precision": [pt_prec_v]})
+            point = alt.Chart(point_frame).mark_point(color=ORANGE, size=100).encode(x="recall:Q", y="precision:Q")
+            layers = layers + point
+        st.altair_chart(layers, use_container_width=True)
 
     # ── Step 7: optimal threshold recommendations ─────────────────────────────
     st.markdown("---")
@@ -438,7 +509,38 @@ Use this tool to explore the trade-off and lock in the threshold that matches yo
         "Click a button to instantly apply that threshold."
     )
 
+    st.markdown("#### Precision-Recall Business Optimizer")
+    pr_c1, pr_c2, pr_c3 = st.columns(3)
+    min_precision = pr_c1.slider("Minimum Precision", 0.0, 1.0, 0.60, 0.01)
+    min_recall = pr_c2.slider("Minimum Recall", 0.0, 1.0, 0.20, 0.01)
+    min_approval_rate = pr_c3.slider("Minimum Approval Rate", 0.0, 1.0, 0.20, 0.01)
+
+    try:
+        pr_best = optimize_threshold_from_pr_curve(
+            y_test,
+            y_prob,
+            min_precision=min_precision,
+            min_recall=min_recall,
+            min_approval_rate=min_approval_rate,
+        )
+    except Exception as exc:
+        st.error(f"Precision-Recall threshold optimization failed: {exc}")
+        return
+
+    pr_metric_cols = st.columns(5)
+    pr_metric_cols[0].metric("PR Threshold", f"{pr_best['threshold']:.2f}")
+    pr_metric_cols[1].metric("Precision", f"{pr_best['precision']:.3f}")
+    pr_metric_cols[2].metric("Recall", f"{pr_best['recall']:.3f}")
+    pr_metric_cols[3].metric("F1", f"{pr_best['f1']:.3f}")
+    pr_metric_cols[4].metric("Approval Rate", f"{pr_best['approval_rate']:.1%}")
+    st.caption(f"Objective used: {pr_best['objective']}")
+
+    if st.button("Apply PR-Optimized Threshold", key="apply_pr_curve_threshold"):
+        st.session_state["thresh_slider"] = float(pr_best["threshold"])
+        st.rerun()
+
     OBJECTIVES = {
+        "PR Curve Optimizer": "pr_curve",
         "Maximize F1":        "f1",
         "Maximize Precision": "precision",
         "Maximize Recall":    "recall",
@@ -446,6 +548,7 @@ Use this tool to explore the trade-off and lock in the threshold that matches yo
         "Maximize Profit":    "profit",
     }
     OBJECTIVE_TIPS = {
+        "pr_curve":  "Uses the precision-recall curve plus minimum precision, recall, and approval-rate constraints.",
         "f1":        "Best balanced trade-off between catching defaulters and approving good borrowers.",
         "precision": "Risk-averse lender: minimise bad loans approved (may reject good borrowers).",
         "recall":    "Catch-all policy: identify every defaulter (accepts more false rejections).",
@@ -456,7 +559,10 @@ Use this tool to explore the trade-off and lock in the threshold that matches yo
     rows = []
     opt_results = {}
     for label, obj in OBJECTIVES.items():
-        best = find_optimal_threshold(y_test, y_prob, objective=obj)
+        if obj == "pr_curve":
+            best = pr_best
+        else:
+            best = find_optimal_threshold(y_test, y_prob, objective=obj)
         opt_results[obj] = best
         rows.append({
             "Objective":          label,
@@ -474,7 +580,11 @@ Use this tool to explore the trade-off and lock in the threshold that matches yo
     btn_cols = st.columns(len(OBJECTIVES))
     for idx, (label, obj) in enumerate(OBJECTIVES.items()):
         with btn_cols[idx]:
-            short = label.replace("Maximize ", "").replace("Balanced (G-Mean)", "Balanced")
+            short = (
+                label.replace("Maximize ", "")
+                .replace("Balanced (G-Mean)", "Balanced")
+                .replace("PR Curve Optimizer", "PR Optimizer")
+            )
             if st.button(short, key=f"apply_{obj}", help=OBJECTIVE_TIPS[obj]):
                 st.session_state["thresh_slider"] = float(opt_results[obj]["threshold"])
                 st.rerun()
@@ -484,6 +594,10 @@ Use this tool to explore the trade-off and lock in the threshold that matches yo
         "switch to **Maximize Recall** if reducing default leakage is the priority, "
         "or **Maximize Profit** for a dollar-weighted optimum."
     )
+
+    if st.button("Apply Recommended Business Threshold", key="apply_business_threshold"):
+        st.session_state["thresh_slider"] = float(threshold_info["threshold"])
+        st.rerun()
 
 
 # ── Page: Audit Logs ──────────────────────────────────────────────────────────
@@ -538,7 +652,11 @@ def main():
     choice = st.sidebar.selectbox("Navigation", menu)
 
     st.sidebar.markdown("---")
-    active_thresh = st.session_state.get("thresh_slider", 0.50)
+    artifacts = _load_artifacts()
+    recommended_thresh = 0.50
+    if artifacts is not None:
+        recommended_thresh = float(artifacts[4].get("threshold", 0.50))
+    active_thresh = st.session_state.get("thresh_slider", recommended_thresh)
     st.sidebar.metric("Active Threshold", f"{active_thresh:.2f}")
     st.sidebar.caption("Set in **Threshold Optimizer**")
 
